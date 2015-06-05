@@ -1,0 +1,538 @@
+#!/usr/bin/perl -w 
+use strict;
+
+BEGIN {
+	die " you must set the REPEAT_RUNNER_LIB env varible!\n"
+	unless defined($ENV{REPEAT_RUNNER_LIB});
+}
+use lib(
+	$ENV{REPEAT_RUNNER_LIB},
+        );
+
+use Getopt::Std;
+use vars qw($opt_a $opt_d $opt_l);
+getopts('a:d:l');
+
+
+$| = 1;
+$SIG{INT} = \&gotControlC;
+use PostData;
+use FileHandle;
+use Iterator::Fasta;
+use Fasta;
+use FastaFile;
+use Widget::blastx;
+use Widget::RepeatMasker;
+use Bio::Search::Hit::HitFactory;
+use Bio::Search::HSP::HSPFactory;
+use PhatHit_utils;
+use XML::Out;
+use FastaChunker;
+use Shadower;
+use Cwd;
+
+
+my $usage = "
+
+repeat_runner:           takes a multifasta file and preforms a repeatmasker run and 
+                         wublastx search of every sequence in that multifasta 
+                         against a repeat database; then combines the HSPs
+                         spits out some xml full of all kinds of useful data--
+                         see repeat_runner/sample_data/sample.out.xml for
+                         for an example of repeat_runner's output. repeat_runner
+                         writes to STDOUT. See repeat_runner/README for more info.
+
+OPTIONS: -d <directory>  datastore root dir. where to write the tmp files 
+	 -l <no low>     run repeat masker with the -nolow option
+         -a <org>        organism (human|mouse|drosophila, etc) required
+	
+EXAMPLE: repeat_runner -d datastore  -a drosophila  sample_data/sample.multi.fasta config/parameters.cfg | tee out.xml 
+
+\n"; 
+
+die $usage unless $ARGV[0] && $ARGV[1] && $opt_a;
+#-----------------------------------------------------------------------------
+#----------------------------------- MAIN ------------------------------------
+#-----------------------------------------------------------------------------
+
+my $file = $ARGV[0];
+my $conf = $ARGV[1];
+
+my $CONF = parse_conf($conf);
+
+my $datastore = $opt_d || 'repeat_runner_datastore'; 
+
+mkdir ($datastore) unless  -e $datastore;
+
+my $fasta_iterator = new Iterator::Fasta($file);
+
+print "<repeat_runner org=\"$opt_a\" blast_db=\"$CONF->{te_proteins}\">\n";
+my $q = 0;
+while (my $query = $fasta_iterator->nextEntry()){
+        my $query_def = Fasta::getDef($query);
+        my $query_seq = Fasta::getSeq($query);
+
+        my ($q_id) = $query_def =~ />(\S+)/;
+
+	$q_id  =~ s/[\/\(\)\'\`]/\_/g;
+
+	die " something strange about this def:$query_def\n"
+	unless defined($q_id);
+
+	my $q_file      = "$datastore/$q_id\.query\.fasta";
+	my $o_file      = "$datastore/$q_id\.query\.blastx";
+	my $rm_proj_dir =  $datastore;
+
+	FastaFile::writeFile(\$query, $q_file);
+
+	print STDERR " NOW PROCESSING:".$q_id."\n";
+
+	my @keepers;
+
+	my $r_keepers = chunk_and_run_repeat_masker($query,
+	                                            $q_file,
+						    $opt_a,
+	                                            $rm_proj_dir, 
+	                                            50000, 
+	                                            $q_id,length($$query_seq));
+
+	my ($r_masked_fasta_file, $r_masked_fasta) = 
+	mask_query($query, $q_file, $r_keepers);
+
+	push(@keepers, @{$r_keepers}) if @{$r_keepers}; 
+
+        my $b_keepers = chunk_and_run_blastx($r_masked_fasta, 
+	                                     $r_masked_fasta_file, 
+	                                     $CONF->{te_proteins}, 
+	                                     $o_file, 
+	                                     50000);
+
+        push(@keepers, @{$b_keepers}) if @{$b_keepers};
+
+	#next unless @keepers;	
+
+	show_names_and_coors($query_def, $query_seq, \@keepers);
+
+	$q++;
+
+	system("rm $q_file");
+}
+print "</repeat_runner>\n";
+print STDERR "repeat_runner.working run on  $file is completed!\n"; 
+#-----------------------------------------------------------------------------
+#---------------------------------- SUBS -------------------------------------
+#-----------------------------------------------------------------------------
+sub parse_conf {
+	my $conf = shift;
+
+	my $fh = new FileHandle();
+	   $fh->open($conf) || die "couldn't find the config file!\n";
+
+	my %conf;
+	while (my $line = <$fh>){
+		chomp($line);
+
+		my @stuff = split(/\:/, $line);
+
+		die " config file format not correct!\n"
+		unless defined($stuff[0]) && defined($stuff[1]);
+
+		my $loc;
+		if ($stuff[1] =~ /#/){
+			($loc) = $stuff[1] =~ /(.*)\#.*/;
+		}
+		else {
+			$loc = $stuff[1];
+		}
+		$loc =~ s/\s+$//;
+		$conf{$stuff[0]} = $loc;
+	}
+
+
+	$fh->close();
+
+	return \%conf;
+}
+#-----------------------------------------------------------------------------
+sub mask_query {
+	my $query   = shift;
+	my $q_file  = shift;
+	my $keepers = shift;
+
+
+	return ($q_file."\.masked", $query) unless @{$keepers};
+
+	my $flank = 10;
+
+        my $def = Fasta::getDef($query);
+        my $seq = Fasta::getSeq($query);
+
+        my @features;
+        foreach my $f (@{$keepers}){
+                foreach my $hsp ($f->hsps()){
+
+                        push(@features, [$hsp->nB('query'), $hsp->nE('query')]);
+                }
+
+        }
+
+        my $masked_seq = Shadower::maskSequence($seq, \@features, $flank, 'N');
+
+	my $masked_fasta = Fasta::toFasta($def."_masked", $masked_seq);
+
+	FastaFile::writeFile($masked_fasta, $q_file."\.masked");
+	
+	return ($q_file."\.masked", $$masked_fasta);
+
+}
+#-----------------------------------------------------------------------------
+sub generic {
+        my $name = shift;
+        my $data = shift;
+        my $attr = shift;
+
+        my $tag = xml(
+                       TAGNAME => $name,
+                       ATTLIST => {@{$attr || []}},
+                       ELEMENT => [@{$data}],
+                       );
+
+        return $tag;
+}
+#-----------------------------------------------------------------------------
+sub show_names_and_coors {
+	my $def     = shift;
+	my $seq     = shift; 
+	my $keepers = shift;
+	
+	#PostData($keepers);
+	my @data;
+	my ($q_name) = $def =~ />(\S+)/;
+
+	my @features;
+	foreach my $f (@{$keepers}){
+		foreach my $hsp ($f->hsps()){
+			my @repeat;
+
+			push(@repeat, generic('source', [ref($hsp)], []));
+			push(@repeat, generic('name', [$hsp->name()], []));
+
+			push(@repeat, generic('begin', [$hsp->nB('query')], ['type', 'query']));
+			push(@repeat, generic('end', [$hsp->nE('query')], ['type', 'query']));
+		
+			push(@repeat, generic('begin', [$hsp->nB('hit')], ['type', 'hit']));
+			push(@repeat, generic('end', [$hsp->nE('hit')], ['type', 'hit']));
+
+			my $significance = $hsp->significance();
+			$significance = "1".$significance if  $significance =~ /^e/;
+
+			push(@repeat, generic('significance', [$significance], []));
+			push(@repeat, generic('score', [$hsp->score()], []));
+
+			push(@data, generic('repeat', \@repeat, [ ]));
+
+			push(@features, [$hsp->nB('query'), $hsp->nE('query')]);
+		}
+
+	}
+
+	my $flank = 10;
+	my $masked_seq = Shadower::maskSequence($seq, \@features, $flank, 'N');
+
+	my $pieces     = Shadower::getPieces($seq, \@features, $flank);
+
+
+	my @p_results;
+	my $i = 0;
+	foreach my $p (sort {$a->{b} <=> $b->{b}} @{$pieces}){
+		my @data;
+
+		my $best_hsp = get_best_hsp($p, $keepers);
+
+		die "no best hsp!\n" unless defined($best_hsp);
+
+		push(@data, generic('begin', [$p->{b}], [])); 
+		push(@data, generic('end', [$p->{e}], []));	
+		push(@data, generic('name', [$best_hsp->name()], []));
+		push(@data, generic('source', [ref($best_hsp)], []));
+
+                my $significance = $best_hsp->significance();
+                   $significance = "1".$significance if  $significance =~ /^e/;
+
+                 push(@data, generic('significance', [$significance], []));
+
+		push(@data, generic('score', [$best_hsp->score()], []));
+
+		push(@p_results, generic('segment', \@data, ['segment_number', $i]));
+		$i++;
+	}
+
+
+	$def =~ s/>//;
+
+	my @result;
+
+	my $query_seq = formatSeq($$seq, 60, 2);
+
+	my $masked_query_seq = formatSeq($$masked_seq, 60, 2);
+
+	push(@result, generic('query_seq', [$query_seq], ['query', $q_name]));
+	push(@result, generic('masked_query_seq', [$masked_query_seq], ['query', $q_name]));
+
+	push(@result, generic('segments', \@p_results, ['query', $q_name]));
+	push(@result, generic('result', \@data, ['query', $q_name]));
+
+	print generic('repeat_runner_output', \@result, ['query', $def])."\n";
+}
+#-----------------------------------------------------------------------------
+sub get_best_hsp {
+	my $p       = shift;
+	my $keepers = shift;
+
+	my @overlaps;
+        foreach my $f (@{$keepers}){
+                foreach my $hsp ($f->hsps()){
+			push(@overlaps, $hsp) 
+			if $hsp->start('query') >= $p->{b} 
+			&& $hsp->start('query') <= $p->{e};
+		}
+	}
+	my @sorted = reverse sort poly_sort @overlaps;
+	return shift(@sorted);
+
+}
+#-----------------------------------------------------------------------------
+sub poly_sort {
+	length(ref($a)) <=> length(ref($b)) ||  $a->score <=> $b->score
+}
+#-----------------------------------------------------------------------------
+sub chunk_and_run_blastx {
+	my $query      = shift;
+	my $q_file     = shift;
+	my $db         = shift;
+	my $o_file     = shift;
+	my $chunk_size = shift;
+	
+
+        my $fasta_chunker = new FastaChunker();
+           $fasta_chunker->parent_fasta($query);
+           $fasta_chunker->chunk_size($chunk_size);
+           $fasta_chunker->load_chunks();
+
+        my $keepers = [];
+        my $j = 0;
+        while (my $chunk = $fasta_chunker->get_chunk($j)){
+                my $chunk_number = $chunk->number();
+
+                my $file_name = "$q_file\.$chunk_number";
+
+                $chunk->write_file($file_name);
+
+                my $out_file = "$o_file\.$chunk_number";
+
+                runBLASTX($file_name, $db, $out_file);
+
+                my $sio            = parseBlast($out_file);
+                my $little_keepers = keepers($sio);
+
+                PhatHit_utils::add_offset($little_keepers, $chunk->offset());
+                PhatHit_utils::merge_hits($keepers,  $little_keepers, 10000);
+
+                $chunk->erase_file();
+                $j++;
+        }
+        PhatHit_utils::reset_query_lengths($keepers,
+                                           $fasta_chunker->parent_seq_length,
+                                           );
+
+	return $keepers;
+}
+#-----------------------------------------------------------------------------
+sub chunk_and_run_repeat_masker {
+        my $query      = shift;
+        my $q_file     = shift;
+        my $org        = shift;
+        my $projDir    = shift;
+        my $chunk_size = shift;
+	my $q_id       = shift;
+	my $q_length   = shift;
+
+        my $fasta_chunker = new FastaChunker();
+           $fasta_chunker->parent_fasta($query);
+           $fasta_chunker->chunk_size($chunk_size);
+           $fasta_chunker->load_chunks();
+
+
+        my $keepers = [];
+        my $j = 0;
+        while (my $chunk = $fasta_chunker->get_chunk($j)){
+                my $chunk_number = $chunk->number();
+
+                my $file_name = "$q_file\.$chunk_number\.rm";
+		my $o_file    = "$file_name\.out";
+
+                $chunk->write_file($file_name);
+
+           	my $command   .= $CONF->{repeatmasker};
+
+		$command .= " $file_name ";
+		$command .= " -lib  ".$CONF->{rm_lib} if defined($CONF->{rm_lib});
+		$command .= "  -dir $projDir ";
+		$command .= " -nolow" if $opt_l;	
+
+                runRepeatMasker($command, $o_file);
+
+		my $little_keepers = 
+		Widget::RepeatMasker::parse($o_file, $q_id, $q_length);
+
+		PhatHit_utils::add_offset($little_keepers, $chunk->offset());
+		PhatHit_utils::merge_hits($keepers,  $little_keepers, 10000);
+                $chunk->erase_file();
+                $j++;
+        }
+
+        PhatHit_utils::reset_query_lengths($keepers,
+                                           $fasta_chunker->parent_seq_length,
+                                          );
+
+        return $keepers;
+}
+#-----------------------------------------------------------------------------
+sub format_words {
+        my ($string, $width, $char) = @_;
+        $char = " " unless defined $char;
+        my $len = length($string);
+        my $space = $width - $len;
+        my $tab   = "$char"x$space;
+        $string   = $string.$tab;
+        return $string;
+}
+#------------------------------------------------------------------------------
+sub runRepeatMasker {
+
+	my $command  = shift;
+	my $o_file   = shift;
+
+        my $w = new Widget::RepeatMasker();
+
+        if (-e $o_file){
+                print STDERR "re reading repeat masker report.\n";
+                print STDERR "$o_file\n";
+        }
+        else {
+                print STDERR "running  repeat masker.\n";
+                $w->run($command);
+        }
+
+}
+#------------------------------------------------------------------------------
+sub runBLASTX {
+        my $q_file   = shift;
+        my $db       = shift;
+        my $out_file = shift;
+
+         my $command  = $CONF->{blastx};
+           $command .= " $db $q_file -B500 -V500 -E0.0001";
+           $command .= " wordmask=seg";
+	   $command .= " topComboN=1 ";
+	   $command .= " hspmax=10 ";
+	   #$command .= " gspmax=10 ";
+	   #$command .= " ";
+           $command .= " > $out_file";
+
+        my $w = new Widget::blastx();
+
+        if (-e $out_file){
+                print STDERR "re reading blast report.\n";
+                print STDERR "$out_file\n";
+        }
+        else {
+                print STDERR "running  blast search.\n";
+                $w->run($command);
+        }
+
+}
+#------------------------------------------------------------------------------
+sub formatSeq {
+        my $seq = shift;
+        my $l   = shift;
+        my $d   = shift;
+
+        my $tab = "\t"x$d;
+        my $j = 0;
+        my $fasta ='';
+        for (my $i=0; $i< length($seq);$i+=$l){
+                if ($j == 0){
+                        $fasta .= substr($seq, $i, $l)."\n";
+                } 
+                else {
+                                $fasta .= $tab.substr($seq, $i, $l)."\n";
+                } 
+                $j++;
+        }
+        chomp($fasta);
+        return $fasta;
+}
+#-----------------------------------------------------------------------------
+sub keepers {
+        my $sio = shift;
+
+
+
+        my $result = $sio->next_result();
+
+        my @keepers;
+        my $start = $result->hits();
+        while(my $hit = $result->next_hit) {
+                my $significance = $hit->significance();
+                $significance = "1".$significance if  $significance =~ /^e/;
+                $hit->queryLength($result->query_length);
+                $hit->queryName($result->query_name);
+                next unless $significance < 1e-5;
+		next if $hit->name() eq $result->query_name;
+                my @hsps;
+                while(my $hsp = $hit->next_hsp) {
+			$hsp->query_name($result->query_name);
+
+                        push(@hsps, $hsp) if $hsp->bits > 30;
+                }
+                $hit->hsps(\@hsps);
+                push(@keepers, $hit) if $hit->hsps();
+        }
+        my $end     = @keepers;
+        my $deleted = $start - $end;
+        print STDERR "deleted:$deleted hits\n";
+
+        return \@keepers;
+}
+#-----------------------------------------------------------------------------
+sub parseBlast {
+        my $report = shift;
+
+
+        my $hitType = 'Bio::Search::Hit::PhatHit::blastx';
+        my $hspType = 'Bio::Search::HSP::PhatHSP::blastx';
+
+        my $sio = new Bio::SearchIO(-format => 'blast',
+                                    -file   => $report,
+                                   );
+
+        my $hspFactory = new Bio::Search::HSP::HSPFactory(-type =>$hspType);
+        my $hitFactory = new Bio::Search::Hit::HitFactory(-type =>$hitType);
+
+
+        $sio->_eventHandler->register_factory('hsp', $hspFactory);
+        $sio->_eventHandler->register_factory('hit', $hitFactory);
+
+        return $sio;
+}
+#-----------------------------------------------------------------------------
+sub gotControlC {
+
+        print color("reset");
+        die "died in repeat_runner::gotContolC\n";
+}
+#-----------------------------------------------------------------------------
+
+
+
