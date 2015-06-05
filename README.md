@@ -9,7 +9,7 @@ RepeatRunner is a CGL-based program that integrates RepeatMasker with BLASTX to 
 #Installing
 To run repeat_runner do the following:
 
-1 - Download and install CGL from (www.yandell-lab.org/cgl);
+1 - Download and install [CGL](https://github.com/Yandell-Lab/CGL)
 
 2 - Set the REPEAT_RUNNER_LIB environment varible to point at the repeat_runner/lib directory
 
